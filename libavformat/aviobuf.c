@@ -1015,7 +1015,7 @@ URLContext* ffio_geturlcontext(AVIOContext *s)
 int ffio_copy_url_options(AVIOContext* pb, AVDictionary** avio_opts)
 {
     const char *opts[] = {
-        "headers", "user_agent", "cookies", "http_proxy", "referer", "rw_timeout", "icy", NULL };
+        "headers", "user_agent", "cookies", "http_proxy", "referer", "rw_timeout", "icy", "s3_access_key", "s3_secret_key", NULL};
     const char **opt = opts;
     uint8_t *buf = NULL;
     int ret = 0;

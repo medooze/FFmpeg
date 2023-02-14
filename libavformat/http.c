@@ -31,8 +31,31 @@
 #include "libavutil/bprint.h"
 #include "libavutil/getenv_utf8.h"
 #include "libavutil/opt.h"
+#include "libavutil/sha.h"
 #include "libavutil/time.h"
 #include "libavutil/parseutils.h"
+
+
+#define SIGV4_DO_NOT_USE_CUSTOM_CONFIG
+#include "sigv4/sigv4.h"
+
+
+static int32_t valid_sha256_init(void* ctx)
+{
+        return av_sha_init((struct AVSHA*)ctx, 256);
+}
+
+static int32_t valid_sha256_update(void* ctx, const uint8_t* data, size_t len)
+{
+        av_sha_update((struct AVSHA*)ctx, data, len);
+        return 0;
+}
+
+static int32_t valid_sha256_final(void* ctx, uint8_t* digest, size_t digestLen)
+{
+        av_sha_final((struct AVSHA*)ctx, digest);
+        return 0;
+}
 
 #include "avformat.h"
 #include "http.h"
@@ -136,6 +159,9 @@ typedef struct HTTPContext {
     char *new_location;
     AVDictionary *redirect_cache;
     uint64_t filesize_from_content_range;
+    /* aws sigv4*/
+    char* s3_access_key;
+    char* s3_secret_key;
 } HTTPContext;
 
 #define OFFSET(x) offsetof(HTTPContext, x)
@@ -178,6 +204,8 @@ static const AVOption options[] = {
     { "resource", "The resource requested by a client", OFFSET(resource), AV_OPT_TYPE_STRING, { .str = NULL }, 0, 0, E },
     { "reply_code", "The http status code to return to a client", OFFSET(reply_code), AV_OPT_TYPE_INT, { .i64 = 200}, INT_MIN, 599, E},
     { "short_seek_size", "Threshold to favor readahead over seek.", OFFSET(short_seek_size), AV_OPT_TYPE_INT, { .i64 = 0 }, 0, INT_MAX, D },
+    { "s3_access_key", "AWS S3 access key", OFFSET(s3_access_key), AV_OPT_TYPE_STRING, {.str = NULL }, 0, 0, AV_OPT_FLAG_EXPORT },
+    { "s3_secret_key", "AWS S3 secret key", OFFSET(s3_secret_key), AV_OPT_TYPE_STRING, {.str = NULL }, 0, 0, AV_OPT_FLAG_EXPORT },
     { NULL }
 };
 
@@ -1407,6 +1435,7 @@ static int http_connect(URLContext *h, const char *path, const char *local_path,
     uint64_t off = s->off;
     const char *method;
     int send_expect_100 = 0;
+    size_t headers = 0;
 
     av_bprint_init_for_buffer(&request, s->buffer, sizeof(s->buffer));
 
@@ -1446,9 +1475,11 @@ static int http_connect(URLContext *h, const char *path, const char *local_path,
         }
     }
 
+
     av_bprintf(&request, "%s ", method);
     bprint_escaped_path(&request, path);
     av_bprintf(&request, " HTTP/1.1\r\n");
+
 
     if (post && s->chunked_post)
         av_bprintf(&request, "Transfer-Encoding: chunked\r\n");
@@ -1477,8 +1508,6 @@ static int http_connect(URLContext *h, const char *path, const char *local_path,
     if (!has_header(s->headers, "\r\nConnection: "))
         av_bprintf(&request, "Connection: %s\r\n", s->multiple_requests ? "keep-alive" : "close");
 
-    if (!has_header(s->headers, "\r\nHost: "))
-        av_bprintf(&request, "Host: %s\r\n", hoststr);
     if (!has_header(s->headers, "\r\nContent-Length: ") && s->post_data)
         av_bprintf(&request, "Content-Length: %d\r\n", s->post_datalen);
 
@@ -1494,9 +1523,140 @@ static int http_connect(URLContext *h, const char *path, const char *local_path,
     if (!has_header(s->headers, "\r\nIcy-MetaData: ") && s->icy)
         av_bprintf(&request, "Icy-MetaData: 1\r\n");
 
+    /* Get pointer to signed headers start */
+    headers = request.len;
+
+    if (!has_header(s->headers, "\r\nHost: "))
+       av_bprintf(&request, "Host: %s\r\n", hoststr);
+
     /* now add in custom headers */
     if (s->headers)
         av_bprintf(&request, "%s", s->headers);
+
+    if (s->s3_access_key != NULL && s->s3_secret_key != NULL) {
+        struct SigV4Credentials sigv4Creds;
+        struct SigV4HttpParameters sigv4HttpParams;
+        struct SigV4CryptoInterface cryptoInterface;
+        struct SigV4Parameters sigv4Params;
+        SigV4Status_t status = SigV4Success;
+        struct AVSHA* content_sha256_ctx;
+        char content_sha256_digest[32];
+        char content_sha256_digest_str[65];
+
+        const char* s3_service_name = "s3";
+        char *s3_bucket = NULL, *s3_region = NULL, *host_copy = NULL, *end = NULL;
+
+        // Buffer to hold the authorization header.
+        char pSigv4Auth[2048U];
+        size_t sigv4AuthLen = sizeof(pSigv4Auth);
+
+        // Pointer to signature in the Authorization header that will be populated in
+        // pSigv4Auth by the SigV4_GenerateHTTPAuthorization API function.
+        char* signature = NULL;
+        size_t signatureLen = 0;
+
+        char utc_date[200];
+        char date_ISO8601[SIGV4_ISO_STRING_LEN+1];
+        time_t t;
+        struct tm* tmp;
+
+        /* Calculate iso8601 data*/
+        t = time(NULL);
+        tmp = gmtime(&t);
+
+        if (!strftime(utc_date, sizeof(utc_date), "%FT%TZ", tmp)) {
+                av_log(NULL, AV_LOG_DEBUG, "strftime error in http_connect\n");
+                return AVERROR_UNKNOWN;
+        }
+
+        status = SigV4_AwsIotDateToIso8601(utc_date, strlen(utc_date), date_ISO8601, SIGV4_ISO_STRING_LEN);
+        date_ISO8601[SIGV4_ISO_STRING_LEN] = 0;
+
+        if (status != SigV4Success) {
+                av_log(h, AV_LOG_ERROR, "Failed to parse Date header: %s\n", utc_date);
+                err = AVERROR(EINVAL);
+                goto done;
+        }
+
+        av_bprintf(&request, "x-amz-date: %s\r\n", date_ISO8601);
+
+        /* Calculate SHA256 of the payload*/
+        content_sha256_ctx = av_sha_alloc();
+        av_sha_init(content_sha256_ctx, 256);
+        av_sha_update(content_sha256_ctx, post ? s->post_data : NULL, post ? s->post_datalen : 0U);
+        av_sha_final(content_sha256_ctx, content_sha256_digest);
+        ff_data_to_hex(content_sha256_digest_str, content_sha256_digest, sizeof(content_sha256_digest), 1);
+        av_freep(&content_sha256_ctx);
+
+        av_bprintf(&request, "x-amz-content-sha256: %s\r\n", content_sha256_digest_str);
+        
+        /* Get bucket and region from host string*/
+        host_copy = strdup(hoststr);
+        s3_bucket = av_strtok(host_copy, ".", &end);
+        s3_region = av_strtok(NULL, ".", &end);
+
+        if (s3_bucket == NULL || s3_region == NULL) {
+                av_log(h, AV_LOG_ERROR, "Cannot parse s3 bucket and region from host: %s\n", hoststr);
+                av_freep(&host_copy);
+                av_freep(&cryptoInterface.pHashContext);
+                err = AVERROR(EINVAL);
+                goto done;
+        }
+
+        sigv4HttpParams.pHttpMethod = method;
+        sigv4HttpParams.httpMethodLen = strlen(method);
+        sigv4HttpParams.pPath = path;
+        sigv4HttpParams.pathLen = strlen(path);
+        sigv4HttpParams.pQuery = NULL;
+        sigv4HttpParams.queryLen = 0;
+        sigv4HttpParams.flags = 0;
+        sigv4HttpParams.pHeaders = request.str + headers;
+        sigv4HttpParams.headersLen = request.len - headers;
+        sigv4HttpParams.pPayload = post ? s->post_data : NULL;
+        sigv4HttpParams.payloadLen = post ? s->post_datalen : 0U;
+    
+        cryptoInterface.pHashContext = (void*) av_sha_alloc();
+        cryptoInterface.hashInit = valid_sha256_init;
+        cryptoInterface.hashUpdate = valid_sha256_update;
+        cryptoInterface.hashFinal = valid_sha256_final;
+        cryptoInterface.hashBlockLen = SIGV4_HASH_MAX_BLOCK_LENGTH;
+        cryptoInterface.hashDigestLen = SIGV4_HASH_MAX_DIGEST_LENGTH;
+    
+        sigv4Creds.pAccessKeyId = s->s3_access_key;
+        sigv4Creds.accessKeyIdLen = strlen(s->s3_access_key);
+        sigv4Creds.pSecretAccessKey = s->s3_secret_key;
+        sigv4Creds.secretAccessKeyLen = strlen(s->s3_secret_key);
+
+        sigv4Params.pAlgorithm = SIGV4_AWS4_HMAC_SHA256;
+        sigv4Params.algorithmLen = SIGV4_AWS4_HMAC_SHA256_LENGTH;
+        // Parsed temporary credentials obtained from AWS IoT Credential Provider.
+        sigv4Params.pCredentials = &sigv4Creds;
+        // Date in ISO8601 format.
+        sigv4Params.pDateIso8601 = date_ISO8601;
+        // The AWS region for the request.
+        sigv4Params.pRegion = s3_region;
+        sigv4Params.regionLen = strlen(s3_region),
+        // The AWS service for the request.
+        sigv4Params.pService = s3_service_name;
+        sigv4Params.serviceLen = strlen(s3_service_name);
+        // SigV4 crypto interface. See SigV4CryptoInterface_t interface documentation.
+        sigv4Params.pCryptoInterface = &cryptoInterface;
+        // HTTP parameters for the HTTP request to generate a SigV4 authorization header for.
+        sigv4Params.pHttpParameters = &sigv4HttpParams;
+
+        status = SigV4_GenerateHTTPAuthorization(&sigv4Params, pSigv4Auth, &sigv4AuthLen, &signature, &signatureLen);
+
+        av_freep(&host_copy);
+        av_freep(&cryptoInterface.pHashContext);
+
+        if (status != SigV4Success) {
+            av_log(h, AV_LOG_ERROR, "Failed to generate authorization header: %d bucket:%s region:%s\n%s\n", status, s3_bucket, s3_region, sigv4HttpParams.pHeaders);
+            err = AVERROR(EINVAL);
+            goto done;
+        }
+
+        av_bprintf(&request, "Authorization: %s\r\n", pSigv4Auth);
+    }
 
     if (authstr)
         av_bprintf(&request, "%s", authstr);
