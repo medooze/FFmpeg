@@ -162,6 +162,8 @@ typedef struct HTTPContext {
     /* aws sigv4*/
     char* s3_access_key;
     char* s3_secret_key;
+    char* s3_bucket;
+    char* s3_region;
 } HTTPContext;
 
 #define OFFSET(x) offsetof(HTTPContext, x)
@@ -206,6 +208,8 @@ static const AVOption options[] = {
     { "short_seek_size", "Threshold to favor readahead over seek.", OFFSET(short_seek_size), AV_OPT_TYPE_INT, { .i64 = 0 }, 0, INT_MAX, D },
     { "s3_access_key", "AWS S3 access key", OFFSET(s3_access_key), AV_OPT_TYPE_STRING, {.str = NULL }, 0, 0, AV_OPT_FLAG_EXPORT },
     { "s3_secret_key", "AWS S3 secret key", OFFSET(s3_secret_key), AV_OPT_TYPE_STRING, {.str = NULL }, 0, 0, AV_OPT_FLAG_EXPORT },
+    { "s3_bucket", "AWS S3 bucket name", OFFSET(s3_bucket), AV_OPT_TYPE_STRING, {.str = NULL }, 0, 0, AV_OPT_FLAG_EXPORT },
+    { "s3_region", "AWS S3 region name", OFFSET(s3_region), AV_OPT_TYPE_STRING, {.str = NULL }, 0, 0, AV_OPT_FLAG_EXPORT },
     { NULL }
 };
 
@@ -1533,7 +1537,7 @@ static int http_connect(URLContext *h, const char *path, const char *local_path,
     if (s->headers)
         av_bprintf(&request, "%s", s->headers);
 
-    if (s->s3_access_key != NULL && s->s3_secret_key != NULL) {
+    if (s->s3_access_key != NULL && s->s3_secret_key != NULL && s->s3_region != NULL && s->s3_bucket != NULL) {
         struct SigV4Credentials sigv4Creds;
         struct SigV4HttpParameters sigv4HttpParams;
         struct SigV4CryptoInterface cryptoInterface;
@@ -1544,7 +1548,6 @@ static int http_connect(URLContext *h, const char *path, const char *local_path,
         char content_sha256_digest_str[65];
 
         const char* s3_service_name = "s3";
-        char *s3_bucket = NULL, *s3_region = NULL, *host_copy = NULL, *end = NULL;
 
         // Buffer to hold the authorization header.
         char pSigv4Auth[2048U];
@@ -1589,19 +1592,6 @@ static int http_connect(URLContext *h, const char *path, const char *local_path,
         av_freep(&content_sha256_ctx);
 
         av_bprintf(&request, "x-amz-content-sha256: %s\r\n", content_sha256_digest_str);
-        
-        /* Get bucket and region from host string*/
-        host_copy = strdup(hoststr);
-        s3_bucket = av_strtok(host_copy, ".", &end);
-        s3_region = av_strtok(NULL, ".", &end);
-
-        if (s3_bucket == NULL || s3_region == NULL) {
-                av_log(h, AV_LOG_ERROR, "Cannot parse s3 bucket and region from host: %s\n", hoststr);
-                av_freep(&host_copy);
-                av_freep(&cryptoInterface.pHashContext);
-                err = AVERROR(EINVAL);
-                goto done;
-        }
 
         sigv4HttpParams.pHttpMethod = method;
         sigv4HttpParams.httpMethodLen = strlen(method);
@@ -1634,8 +1624,8 @@ static int http_connect(URLContext *h, const char *path, const char *local_path,
         // Date in ISO8601 format.
         sigv4Params.pDateIso8601 = date_ISO8601;
         // The AWS region for the request.
-        sigv4Params.pRegion = s3_region;
-        sigv4Params.regionLen = strlen(s3_region),
+        sigv4Params.pRegion = s->s3_region;
+        sigv4Params.regionLen = strlen(s->s3_region),
         // The AWS service for the request.
         sigv4Params.pService = s3_service_name;
         sigv4Params.serviceLen = strlen(s3_service_name);
@@ -1646,11 +1636,10 @@ static int http_connect(URLContext *h, const char *path, const char *local_path,
 
         status = SigV4_GenerateHTTPAuthorization(&sigv4Params, pSigv4Auth, &sigv4AuthLen, &signature, &signatureLen);
 
-        av_freep(&host_copy);
         av_freep(&cryptoInterface.pHashContext);
 
         if (status != SigV4Success) {
-            av_log(h, AV_LOG_ERROR, "Failed to generate authorization header: %d bucket:%s region:%s\n%s\n", status, s3_bucket, s3_region, sigv4HttpParams.pHeaders);
+            av_log(h, AV_LOG_ERROR, "Failed to generate authorization header: %d bucket:%s region:%s\n%s\n", status, s->s3_bucket, s->s3_region, sigv4HttpParams.pHeaders);
             err = AVERROR(EINVAL);
             goto done;
         }
