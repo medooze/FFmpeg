@@ -1644,7 +1644,7 @@ static int http_connect(URLContext *h, const char *path, const char *local_path,
             goto done;
         }
 
-        av_bprintf(&request, "Authorization: %s\r\n", pSigv4Auth);
+        av_bprintf(&request, "Authorization: %.*s\r\n", (int)sigv4AuthLen, pSigv4Auth);
     }
 
     if (authstr)
