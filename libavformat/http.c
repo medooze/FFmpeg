@@ -37,7 +37,7 @@
 
 
 #define SIGV4_DO_NOT_USE_CUSTOM_CONFIG
-#include "sigv4/sigv4.h"
+#include "sigv4.h"
 
 
 static int32_t valid_sha256_init(void* ctx)
