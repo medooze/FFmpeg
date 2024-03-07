@@ -1006,7 +1006,7 @@ void ffio_write_lines(AVIOContext *s, const unsigned char *buf, int size,
 int ffio_copy_url_options(AVIOContext* pb, AVDictionary** avio_opts)
 {
     const char *opts[] = {
-        "headers", "user_agent", "cookies", "http_proxy", "referer", "rw_timeout", "icy", NULL };
+        "headers", "user_agent", "cookies", "http_proxy", "referer", "rw_timeout", "icy", "s3_access_key", "s3_secret_key", "s3_bucket", "s3_region", NULL};
     const char **opt = opts;
     uint8_t *buf = NULL;
     int ret = 0;
