@@ -3688,6 +3688,10 @@ static const AVOption options[] = {
         AV_OPT_TYPE_BOOL, {.i64 = 0}, 0, 1, PAR },
     { "strict-displaywin", "stricly apply default display window size", OFFSET(apply_defdispwin),
         AV_OPT_TYPE_BOOL, {.i64 = 0}, 0, 1, PAR },
+    { "is_nalff", "Bitstream is encapsulated as a format defined in 14496-15", OFFSET(is_nalff),
+        AV_OPT_TYPE_BOOL, {.i64 = 0}, 0, 1, PAR },
+    { "nal_length_size", "Number of bytes used for nal length (1, 2 or 4)", OFFSET(nal_length_size),
+        AV_OPT_TYPE_INT, {.i64 = 0}, 0, 4, PAR },
     { NULL },
 };
 
